@@ -1,0 +1,157 @@
+name: Release iOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Build & Release iOS
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Generate code (Riverpod)
+        working-directory: app
+        run: dart run build_runner build --delete-conflicting-outputs
+
+      - name: Bump build number
+        working-directory: app
+        run: |
+          BASE=$(grep '^version:' pubspec.yaml | sed -E 's/^version: ([0-9.]+).*/\1/')
+          NEW="${BASE}+${{ github.run_number }}"
+          sed -i.bak -E "s/^version: .*/version: ${NEW}/" pubspec.yaml
+          rm -f pubspec.yaml.bak
+          echo "Build version: ${NEW}"
+
+      - name: Install CocoaPods dependencies
+        working-directory: app/ios
+        run: |
+          # An app without iOS plugins has no Podfile (Flutter only writes one
+          # when a plugin needs CocoaPods) — pod install would fail on it.
+          if [ -f Podfile ]; then pod install; else echo "No Podfile (no iOS plugins) — skipping"; fi
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          echo -n "$CERTIFICATE_P12_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $RUNNER_TEMP/certificate.p12 -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+          echo "=== Imported certificates ==="
+          security find-identity -v -p codesigning $KEYCHAIN_PATH
+
+      - name: Install provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+        run: |
+          PP_PATH=$RUNNER_TEMP/profile.mobileprovision
+          echo -n "$PROVISIONING_PROFILE_BASE64" | base64 --decode > $PP_PATH
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          DECODED=$(security cms -D -i "$PP_PATH")
+          UUID=$(echo "$DECODED" | plutil -extract UUID raw -)
+          PROFILE_NAME=$(echo "$DECODED" | plutil -extract Name raw -)
+          BUNDLE_ID=$(echo "$DECODED" | plutil -extract Entitlements.application-identifier raw - | sed 's/^[^.]*\.//')
+          EXPIRY=$(echo "$DECODED" | plutil -extract ExpirationDate raw -)
+          PROFILE_TYPE=$(echo "$DECODED" | plutil -extract ProvisionsAllDevices raw - 2>/dev/null && echo "Enterprise" || (echo "$DECODED" | plutil -extract Entitlements.get-task-allow raw - 2>/dev/null | grep -q true && echo "Development" || echo "Distribution/AppStore"))
+          echo "=== Provisioning profile info ==="
+          echo "Profile name:      $PROFILE_NAME"
+          echo "Profile UUID:      $UUID"
+          echo "Profile bundle ID: $BUNDLE_ID"
+          echo "Profile expires:   $EXPIRY"
+          echo "Profile type:      $PROFILE_TYPE"
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision
+          echo "PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_ENV
+          echo "PROFILE_UUID=$UUID" >> $GITHUB_ENV
+
+      - name: Inject profile UUID into project
+        run: |
+          # Two expressions cover both quoted ("CI_PROFILE_NAME") and unquoted
+          # (CI_PROFILE_NAME) forms — a single-expression sed double-quotes the
+          # already-quoted placeholder and corrupts the pbxproj ("project damaged").
+          sed -i '' \
+            -e "s/\"CI_PROFILE_NAME\"/\"$PROFILE_UUID\"/g" \
+            -e "s/CI_PROFILE_NAME/\"$PROFILE_UUID\"/g" \
+            app/ios/Runner.xcodeproj/project.pbxproj
+          grep PROVISIONING_PROFILE_SPECIFIER app/ios/Runner.xcodeproj/project.pbxproj
+
+      - name: Build Flutter iOS (no codesign)
+        working-directory: app
+        run: flutter build ios --release --no-codesign --dart-define=SUPABASE_URL=${{ secrets.SUPABASE_URL }} --dart-define=SUPABASE_PUBLISHABLE_KEY=${{ secrets.SUPABASE_PUBLISHABLE_KEY }}
+
+      - name: Archive with manual signing
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        working-directory: app
+        run: |
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -archivePath $RUNNER_TEMP/Runner.xcarchive \
+            DEVELOPMENT_TEAM=$TEAM_ID
+
+      - name: Export IPA
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :teamID $TEAM_ID" app/ios/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Set :provisioningProfiles:com.ol1n.automatka $PROFILE_NAME" app/ios/ExportOptions.plist
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/Runner.xcarchive \
+            -exportOptionsPlist app/ios/ExportOptions.plist \
+            -exportPath $RUNNER_TEMP/ipa
+
+      - name: Upload to TestFlight
+        env:
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo -n "$API_KEY_BASE64" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${API_KEY_ID}.p8
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$(ls $RUNNER_TEMP/ipa/*.ipa)" \
+            --apiKey "$API_KEY_ID" \
+            --apiIssuer "$API_ISSUER_ID"
+
+      - name: Upload IPA to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/ipa/*.ipa
+          name: Automatka ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+          rm -f ~/.appstoreconnect/private_keys/AuthKey_*.p8
