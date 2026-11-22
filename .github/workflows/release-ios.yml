@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-ios:
     name: Build & Release iOS
-    runs-on: macos-26
+    runs-on: xcode-27
 
     steps:
       - name: Checkout
